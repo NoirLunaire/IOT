@@ -14,10 +14,14 @@
 #include "main.h"
 #include "uart.h"
 #include "uart-mmio.h"
+#include "ring.h"
 #include "isr.h"
 
 extern uint32_t irq_stack_top;
 extern uint32_t stack_top;
+
+char line[MAX_CHARS];
+uint32_t nchars = 0;
 
 void check_stacks() {
   void *memsize = (void*)MEMORY;
@@ -30,22 +34,30 @@ void check_stacks() {
     panic();
 }
 
-void interrupt_handler (uint32_t irq, void* cookie) { 
+void rx_handler (uint32_t irq, void* cookie) { 
   uint32_t irqs = mmio_read32((void*)UART0_BASE_ADDRESS, UART_MIS);
   if (irqs & UART_IMSC_RXIM) {
-    char c;
-    uart_receive(UART0, &c);
-    while (c) {
-      uart_send(UART0, c);
-      uart_receive(UART0, &c);
+    char code = uart_receive(UART0);
+    while (code) {
+      if (ring_full()) { panic(); }
+      ring_put(code);
+      code = uart_receive(UART0);
     }
     mmio_set((void*)UART0_BASE_ADDRESS, UART_ICR, UART_IMSC_RXIM);
-    mmio_set((void*)UART0_BASE_ADDRESS, UART_ICR, UART_IMSC_TXIM);
-    vic_ack_irq(irqs & UART_IMSC_RXIM);
     return;	
   }
 
   panic();
+}
+
+void process_ring () {
+	uint8_t code;
+	while (!ring_empty()) {
+		code = ring_get();
+		line[nchars++] = (char)code;
+		uart_send(UART0, code);
+		if (code == '\n') { nchars = 0; }
+	}
 }
 
 /**
@@ -58,11 +70,16 @@ void _start(void) {
   uarts_init();
   uart_enable(UART0);
   vic_setup_irqs();
-  vic_enable_irq(UART0_IRQ, &interrupt_handler, NULL);
+  vic_enable_irq(UART0_IRQ, &rx_handler, NULL);
   core_enable_irqs();
 
   for (;;) {
-    core_halt();
+	process_ring();
+	core_disable_irqs();
+	if (ring_empty()) {
+		core_enable_irqs(); // obligatoire
+		core_halt();
+	}
   }
 
   core_disable_irqs();
